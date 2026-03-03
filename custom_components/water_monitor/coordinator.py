@@ -1,6 +1,7 @@
 """DataUpdateCoordinator for BVK Water Monitor."""
 from __future__ import annotations
 
+import html as _html
 import logging
 import re
 from typing import Any
@@ -29,7 +30,14 @@ _BVK_FIELD_EMAIL = "ctl00$ctl00$lvLoginForm$LoginDialog1$edEmail"
 _BVK_FIELD_PASSWORD = "ctl00$ctl00$lvLoginForm$LoginDialog1$edPassword"
 _BVK_FIELD_SUBMIT = "ctl00$ctl00$lvLoginForm$LoginDialog1$btnLogin"
 
-_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; HA-water-monitor/1.0)"}
+# Use a realistic browser User-Agent so portals return full page content
+_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    )
+}
 
 
 class BVKWaterCoordinator(DataUpdateCoordinator[dict[str, Any]]):
@@ -44,23 +52,20 @@ class BVKWaterCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         )
         self._username: str = entry.data[CONF_USERNAME]
         self._password: str = entry.data[CONF_PASSWORD]
-        self._suez_token_url: str = entry.data[CONF_SUEZ_TOKEN_URL]
-        # Dedicated session with its own cookie jar so SUEZ auth cookies
-        # are isolated and not shared with other HA integrations.
+        # Fallback token URL (used only when BVK auto-detection fails)
+        self._suez_token_url: str = entry.data.get(CONF_SUEZ_TOKEN_URL, "")
         self._session: aiohttp.ClientSession | None = None
 
     # ------------------------------------------------------------------
     # Session management
     # ------------------------------------------------------------------
 
-    def _get_session(self) -> aiohttp.ClientSession:
-        """Return (or lazily create) the dedicated aiohttp session."""
-        if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession(
-                cookie_jar=aiohttp.CookieJar(unsafe=True),
-                headers=_HEADERS,
-            )
-        return self._session
+    def _new_session(self) -> aiohttp.ClientSession:
+        """Create a fresh dedicated session with an isolated cookie jar."""
+        return aiohttp.ClientSession(
+            cookie_jar=aiohttp.CookieJar(unsafe=True),
+            headers=_HEADERS,
+        )
 
     async def async_shutdown(self) -> None:
         """Close the dedicated HTTP session on unload."""
@@ -122,7 +127,7 @@ class BVKWaterCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         return True
 
     async def _bvk_find_suez_token_url(self, session: aiohttp.ClientSession) -> str | None:
-        """After BVK login, try to extract the SUEZ token URL from ConsumptionPlaceList."""
+        """After BVK login, extract a fresh SUEZ token URL from ConsumptionPlaceList."""
         try:
             async with session.get(
                 BVK_PLACE_LIST_URL, timeout=aiohttp.ClientTimeout(total=30)
@@ -132,19 +137,21 @@ class BVKWaterCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         except aiohttp.ClientError:
             return None
 
+        # Look for a full SUEZ Login URL (stop at quote/angle-bracket; unescape &amp; → &)
         match = re.search(
-            r"(https://cz-sitr\.suezsmartsolutions\.com/eMIS\.SE_BVK/Login\.aspx\?token=[^\s\"'&]+)",
+            r"(https://cz-sitr\.suezsmartsolutions\.com/eMIS\.SE_BVK/Login\.aspx\?token=[^\s\"'<>]+)",
             html,
         )
         if match:
-            return match.group(1)
+            return _html.unescape(match.group(1))
 
+        # Fallback: hidden field that some BVK page variants use
         cscpt = _extract_hidden(
             html,
             "ctl00_ctl00_ContentPlaceHolder1Common_ContentPlaceHolder1_hfCSCPT",
         )
         if cscpt and cscpt.startswith("http"):
-            return cscpt
+            return _html.unescape(cscpt)
 
         return None
 
@@ -152,19 +159,19 @@ class BVKWaterCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     # SUEZ portal helpers
     # ------------------------------------------------------------------
 
-    async def _suez_authenticate(self, session: aiohttp.ClientSession) -> None:
-        """Authenticate with SUEZ using the stored token URL, setting session cookies."""
-        if not self._suez_token_url:
-            raise ConfigEntryAuthFailed("No SUEZ token URL configured")
+    async def _suez_authenticate(
+        self, session: aiohttp.ClientSession, token_url: str
+    ) -> None:
+        """Authenticate with SUEZ using the given token URL, setting session cookies."""
         try:
             async with session.get(
-                self._suez_token_url,
+                token_url,
                 allow_redirects=True,
                 timeout=aiohttp.ClientTimeout(total=30),
             ) as resp:
                 resp.raise_for_status()
                 final_url = str(resp.url)
-                html = await resp.text()
+                await resp.text()
         except aiohttp.ClientError as exc:
             raise UpdateFailed(f"SUEZ authentication request failed: {exc}") from exc
 
@@ -175,10 +182,15 @@ class BVKWaterCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             )
         _LOGGER.debug("SUEZ authenticated, landed on %s", final_url)
 
-    async def _suez_get_html(self, session: aiohttp.ClientSession, url: str) -> str:
+    async def _suez_get_html(
+        self,
+        session: aiohttp.ClientSession,
+        url: str,
+        token_url: str = "",
+    ) -> str:
         """
         Fetch a SUEZ page.  If the response is the login page (session expired),
-        re-authenticate once and retry.
+        re-authenticate once using token_url and retry.
         """
         async with session.get(
             url, allow_redirects=True, timeout=aiohttp.ClientTimeout(total=30)
@@ -187,9 +199,9 @@ class BVKWaterCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             final_url = str(resp.url)
             html = await resp.text()
 
-        if "Login.aspx" in final_url:
+        if "Login.aspx" in final_url and token_url:
             _LOGGER.debug("SUEZ session expired, re-authenticating before %s", url)
-            await self._suez_authenticate(session)
+            await self._suez_authenticate(session, token_url)
             async with session.get(
                 url, allow_redirects=True, timeout=aiohttp.ClientTimeout(total=30)
             ) as resp2:
@@ -269,15 +281,47 @@ class BVKWaterCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     # ------------------------------------------------------------------
 
     async def _async_update_data(self) -> dict[str, Any]:
-        """Authenticate with SUEZ (if needed) then fetch consumption data."""
-        session = self._get_session()
+        """Log into BVK for a fresh SUEZ token, authenticate, then fetch consumption data."""
 
-        # Always authenticate on each cycle to ensure a fresh SUEZ session.
-        # The token URL is long-lived; the round-trip is ~200 ms.
+        # Start each poll cycle with a clean session so there are no stale cookies
+        # from a previous cycle that could interfere with authentication.
+        if self._session and not self._session.closed:
+            await self._session.close()
+        self._session = self._new_session()
+        session = self._session
+
+        # --- Step 1: BVK login → extract fresh SUEZ token URL ---
+        suez_token_url: str | None = None
         try:
-            await self._suez_authenticate(session)
-            home_html = await self._suez_get_html(session, SUEZ_HOME_URL)
-            daily_html = await self._suez_get_html(session, SUEZ_DAILY_URL)
+            await self._bvk_login(session)
+            suez_token_url = await self._bvk_find_suez_token_url(session)
+            if suez_token_url:
+                _LOGGER.debug("Got fresh SUEZ token URL via BVK portal")
+            else:
+                _LOGGER.debug(
+                    "BVK login succeeded but SUEZ token URL not found in page; "
+                    "falling back to stored token URL"
+                )
+        except ConfigEntryAuthFailed:
+            raise
+        except UpdateFailed as exc:
+            _LOGGER.debug("BVK auto-detection failed (%s); trying stored token URL", exc)
+
+        # Fall back to the token URL stored during config (may be empty)
+        if not suez_token_url:
+            suez_token_url = self._suez_token_url or None
+
+        if not suez_token_url:
+            raise UpdateFailed(
+                "No SUEZ token URL available. BVK auto-detection failed and no stored "
+                "token URL is configured. Please reconfigure the integration."
+            )
+
+        # --- Step 2: SUEZ authenticate and fetch data ---
+        try:
+            await self._suez_authenticate(session, suez_token_url)
+            home_html = await self._suez_get_html(session, SUEZ_HOME_URL, suez_token_url)
+            daily_html = await self._suez_get_html(session, SUEZ_DAILY_URL, suez_token_url)
         except ConfigEntryAuthFailed:
             raise
         except aiohttp.ClientError as exc:
