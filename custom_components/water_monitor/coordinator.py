@@ -10,6 +10,7 @@ import aiohttp
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .const import (
@@ -45,25 +46,17 @@ class BVKWaterCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._username: str = entry.data[CONF_USERNAME]
         self._password: str = entry.data[CONF_PASSWORD]
         self._suez_token_url: str = entry.data[CONF_SUEZ_TOKEN_URL]
-        # Shared aiohttp session (created/closed in __aenter__/__aexit__ or lazily)
-        self._session: aiohttp.ClientSession | None = None
 
     # ------------------------------------------------------------------
     # Session management
     # ------------------------------------------------------------------
 
     async def _get_session(self) -> aiohttp.ClientSession:
-        if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession(
-                headers={"User-Agent": "Mozilla/5.0 (compatible; HA-water-monitor/1.0)"},
-                cookie_jar=aiohttp.CookieJar(),
-            )
-        return self._session
+        """Return HA's shared aiohttp session (handles SSL/proxy correctly)."""
+        return async_get_clientsession(self.hass)
 
     async def async_shutdown(self) -> None:
-        """Close the HTTP session when the integration is unloaded."""
-        if self._session and not self._session.closed:
-            await self._session.close()
+        """Clean up when the integration is unloaded."""
         await super().async_shutdown()
 
     # ------------------------------------------------------------------
