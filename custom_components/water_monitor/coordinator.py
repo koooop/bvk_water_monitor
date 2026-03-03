@@ -127,32 +127,105 @@ class BVKWaterCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         return True
 
     async def _bvk_find_suez_token_url(self, session: aiohttp.ClientSession) -> str | None:
-        """After BVK login, extract a fresh SUEZ token URL from ConsumptionPlaceList."""
+        """After BVK login, extract a fresh SUEZ token URL from BVK pages.
+
+        Tries ConsumptionPlaceList first (direct URL, hidden field, postback),
+        then falls back to the BVK home page.
+        """
+        pages_to_try = [
+            ("ConsumptionPlaceList", BVK_PLACE_LIST_URL),
+            ("home", BVK_LOGIN_URL),
+        ]
+
+        for page_name, url in pages_to_try:
+            try:
+                async with session.get(
+                    url, timeout=aiohttp.ClientTimeout(total=30)
+                ) as resp:
+                    resp.raise_for_status()
+                    html = await resp.text()
+            except aiohttp.ClientError as exc:
+                _LOGGER.debug("BVK %s fetch failed: %s", page_name, exc)
+                continue
+
+            # Diagnostic: count references to help troubleshoot
+            n_sitr = html.lower().count("cz-sitr")
+            n_suez = html.lower().count("suez")
+            n_token = html.count("token=")
+            _LOGGER.debug(
+                "BVK %s: length=%d  cz-sitr=%d  suez=%d  token==%d",
+                page_name, len(html), n_sitr, n_suez, n_token,
+            )
+            for keyword in ("cz-sitr", "token="):
+                idx = html.lower().find(keyword)
+                if idx != -1:
+                    snippet = " ".join(html[max(0, idx - 80):idx + 250].split())
+                    _LOGGER.debug("BVK %s snippet[%s]: %s", page_name, keyword, snippet)
+
+            # 1. Direct URL anywhere in HTML/JS
+            match = re.search(
+                r"(https://cz-sitr\.suezsmartsolutions\.com[^\s\"'<>\\]+)",
+                html,
+            )
+            if match:
+                return _html.unescape(match.group(1))
+
+            # 2. Hidden field hfCSCPT
+            cscpt = _extract_hidden(
+                html,
+                "ctl00_ctl00_ContentPlaceHolder1Common_ContentPlaceHolder1_hfCSCPT",
+            )
+            if cscpt and cscpt.startswith("http"):
+                return _html.unescape(cscpt)
+
+            # 3. Postback-based redirect (only on ConsumptionPlaceList)
+            if url == BVK_PLACE_LIST_URL:
+                postback_targets = re.findall(r"__doPostBack\('([^']+)'", html)
+                _LOGGER.debug("BVK %s postback targets: %s", page_name, postback_targets)
+                suez_targets = [
+                    t for t in postback_targets
+                    if any(kw in t.lower() for kw in ("suez", "smart", "odber"))
+                ]
+                if suez_targets:
+                    token_url = await self._bvk_postback_redirect(
+                        session, html, suez_targets[0]
+                    )
+                    if token_url:
+                        return token_url
+
+        return None
+
+    async def _bvk_postback_redirect(
+        self,
+        session: aiohttp.ClientSession,
+        page_html: str,
+        event_target: str,
+    ) -> str | None:
+        """Simulate an ASP.NET postback and capture the SUEZ token URL from the redirect."""
+        payload = {
+            "__VIEWSTATE": _extract_hidden(page_html, "__VIEWSTATE") or "",
+            "__VIEWSTATEGENERATOR": _extract_hidden(page_html, "__VIEWSTATEGENERATOR") or "",
+            "__PREVIOUSPAGE": _extract_hidden(page_html, "__PREVIOUSPAGE") or "",
+            "__EVENTVALIDATION": _extract_hidden(page_html, "__EVENTVALIDATION") or "",
+            "__EVENTTARGET": event_target,
+            "__EVENTARGUMENT": "",
+        }
         try:
-            async with session.get(
-                BVK_PLACE_LIST_URL, timeout=aiohttp.ClientTimeout(total=30)
+            async with session.post(
+                BVK_PLACE_LIST_URL,
+                data=payload,
+                allow_redirects=False,
+                timeout=aiohttp.ClientTimeout(total=30),
             ) as resp:
-                resp.raise_for_status()
-                html = await resp.text()
-        except aiohttp.ClientError:
-            return None
-
-        # Look for a full SUEZ Login URL (stop at quote/angle-bracket; unescape &amp; → &)
-        match = re.search(
-            r"(https://cz-sitr\.suezsmartsolutions\.com/eMIS\.SE_BVK/Login\.aspx\?token=[^\s\"'<>]+)",
-            html,
-        )
-        if match:
-            return _html.unescape(match.group(1))
-
-        # Fallback: hidden field that some BVK page variants use
-        cscpt = _extract_hidden(
-            html,
-            "ctl00_ctl00_ContentPlaceHolder1Common_ContentPlaceHolder1_hfCSCPT",
-        )
-        if cscpt and cscpt.startswith("http"):
-            return _html.unescape(cscpt)
-
+                location = resp.headers.get("Location", "")
+                _LOGGER.debug(
+                    "BVK postback(%s): status=%d  Location=%s",
+                    event_target, resp.status, location,
+                )
+                if "cz-sitr" in location and "token=" in location:
+                    return location
+        except aiohttp.ClientError as exc:
+            _LOGGER.debug("BVK postback failed: %s", exc)
         return None
 
     # ------------------------------------------------------------------
@@ -163,24 +236,33 @@ class BVKWaterCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self, session: aiohttp.ClientSession, token_url: str
     ) -> None:
         """Authenticate with SUEZ using the given token URL, setting session cookies."""
+        _LOGGER.debug("SUEZ auth: requesting %s", token_url[:80])
         try:
             async with session.get(
                 token_url,
                 allow_redirects=True,
                 timeout=aiohttp.ClientTimeout(total=30),
+                headers={
+                    "Referer": "https://zis.bvk.cz/ConsumptionPlaceList.aspx",
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Accept-Language": "cs-CZ,cs;q=0.9,en;q=0.8",
+                },
             ) as resp:
                 resp.raise_for_status()
                 final_url = str(resp.url)
-                await resp.text()
+                html = await resp.text()
         except aiohttp.ClientError as exc:
             raise UpdateFailed(f"SUEZ authentication request failed: {exc}") from exc
 
-        if "Login.aspx" in final_url and "token=" not in final_url:
+        _LOGGER.debug("SUEZ auth: landed on %s (html length=%d)", final_url, len(html))
+
+        # Check for failed auth: redirected back to login page without a token
+        final_path = final_url.split("?")[0]
+        if final_path.endswith("Login.aspx") and "token=" not in final_url:
             raise ConfigEntryAuthFailed(
                 "SUEZ token URL is invalid or has expired — "
                 "please reconfigure the integration with a fresh token URL"
             )
-        _LOGGER.debug("SUEZ authenticated, landed on %s", final_url)
 
     async def _suez_get_html(
         self,
