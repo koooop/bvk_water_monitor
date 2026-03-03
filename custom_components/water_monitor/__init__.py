@@ -3,7 +3,6 @@ from __future__ import annotations
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import ConfigEntryNotReady
 
 from .const import DOMAIN
 from .coordinator import BVKWaterCoordinator
@@ -15,12 +14,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up BVK Water Monitor from a config entry."""
     coordinator = BVKWaterCoordinator(hass, entry)
 
-    # Perform the first data fetch; this also authenticates with SUEZ
-    try:
-        await coordinator._suez_authenticate(await coordinator._get_session())
-    except Exception as exc:  # noqa: BLE001
-        raise ConfigEntryNotReady(f"Cannot authenticate with SUEZ portal: {exc}") from exc
-
+    # First refresh authenticates with SUEZ and fetches initial data.
+    # ConfigEntryNotReady is raised automatically by async_config_entry_first_refresh
+    # if UpdateFailed or ConfigEntryAuthFailed is thrown.
     await coordinator.async_config_entry_first_refresh()
 
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
