@@ -15,6 +15,13 @@
         "data": {
           "suez_token_url": "SUEZ token URL"
         }
+      },
+      "reauth_confirm": {
+        "title": "BVK Water Monitor – Refresh SUEZ Token",
+        "description": "Your SUEZ token has expired. Please provide a fresh one.\n\n{suez_instructions}\n\nThe URL should start with `https://cz-sitr.suezsmartsolutions.com/eMIS.SE_BVK/Login.aspx?token=`",
+        "data": {
+          "suez_token_url": "SUEZ token URL"
+        }
       }
     },
     "error": {
@@ -23,7 +30,8 @@
       "invalid_token_url": "The URL does not look like a valid SUEZ token URL."
     },
     "abort": {
-      "already_configured": "This BVK account is already configured."
+      "already_configured": "This BVK account is already configured.",
+      "reauth_successful": "Re-authentication successful."
     }
   }
 }

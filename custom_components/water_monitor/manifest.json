@@ -1,7 +1,7 @@
 {
   "domain": "water_monitor",
   "name": "BVK Water Monitor",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "config_flow": true,
   "documentation": "https://github.com/koooop/bvk_water_monitor",
   "issue_tracker": "https://github.com/koooop/bvk_water_monitor/issues",

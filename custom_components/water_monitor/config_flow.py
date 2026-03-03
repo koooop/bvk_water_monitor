@@ -118,6 +118,44 @@ class WaterMonitorConfigFlow(ConfigFlow, domain=DOMAIN):
         )
 
     # ------------------------------------------------------------------
+    # Re-authentication (token expired)
+    # ------------------------------------------------------------------
+
+    async def async_step_reauth(
+        self, entry_data: dict[str, Any]
+    ) -> ConfigFlowResult:
+        """Triggered by ConfigEntryAuthFailed when the SUEZ token expires."""
+        return await self.async_step_reauth_confirm()
+
+    async def async_step_reauth_confirm(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Show form to collect a fresh SUEZ token URL."""
+        errors: dict[str, str] = {}
+
+        if user_input is not None:
+            token_url = user_input[CONF_SUEZ_TOKEN_URL].strip()
+            if not _SUEZ_URL_PATTERN.match(token_url):
+                errors[CONF_SUEZ_TOKEN_URL] = "invalid_token_url"
+            else:
+                return self.async_update_reload_and_abort(
+                    self._get_reauth_entry(),
+                    data_updates={CONF_SUEZ_TOKEN_URL: token_url},
+                )
+
+        return self.async_show_form(
+            step_id="reauth_confirm",
+            data_schema=_STEP2_SCHEMA,
+            errors=errors,
+            description_placeholders={
+                "suez_instructions": (
+                    "Log in to https://zis.bvk.cz, navigate to your consumption place, "
+                    "click the smart meter icon, and copy the full URL from your browser."
+                ),
+            },
+        )
+
+    # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
 
