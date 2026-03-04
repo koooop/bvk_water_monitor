@@ -202,7 +202,12 @@ class BVKWaterCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """Authenticate with SUEZ using the given token URL.
 
         Returns the effective SUEZ home URL (with RefSite parameter).
-        Raises UpdateFailed or ConfigEntryAuthFailed on error.
+
+        aiohttp's allow_redirects=True follows the 302 before the cookie jar is
+        updated, so the cookie (SE_BVK_Cookie) is missing from the redirect GET
+        and the portal sends us back to Login.aspx.  We therefore use
+        allow_redirects=False and follow redirects manually so each step sees the
+        cookies set by the previous response.
         """
         _LOGGER.debug("SUEZ auth: requesting %s", token_url[:80])
         _suez_headers = {
@@ -210,61 +215,47 @@ class BVKWaterCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "cs-CZ,cs;q=0.9,en;q=0.8",
         }
-        try:
-            async with session.get(
-                token_url,
-                allow_redirects=True,
-                timeout=aiohttp.ClientTimeout(total=30),
-                headers=_suez_headers,
-            ) as resp:
-                resp.raise_for_status()
-                final_url = str(resp.url)
-                await resp.text()
-        except aiohttp.ClientError as exc:
-            raise UpdateFailed(f"SUEZ authentication request failed: {exc}") from exc
+        current_url = token_url
 
-        _LOGGER.debug("SUEZ auth: step-1 landed on %s", final_url)
+        for step in range(6):  # guard against infinite redirect loops
+            try:
+                async with session.get(
+                    current_url,
+                    allow_redirects=False,
+                    timeout=aiohttp.ClientTimeout(total=30),
+                    headers=_suez_headers,
+                ) as resp:
+                    status = resp.status
+                    location = resp.headers.get("Location", "")
+                    await resp.text()  # consume body so connection is released
+            except aiohttp.ClientError as exc:
+                raise UpdateFailed(f"SUEZ auth request failed: {exc}") from exc
 
-        final_path = final_url.split("?")[0]
-        if not final_path.endswith("Login.aspx"):
-            return final_url
+            _LOGGER.debug("SUEZ auth step %d: status=%d url=%s location=%s",
+                          step + 1, status, current_url[:80], location[:80])
 
-        # Landed on Login.aspx — follow the ReturnUrl to complete ASP.NET Forms Auth
-        return_url_raw = re.search(r"[?&]ReturnUrl=([^&\s]+)", final_url)
-        if not return_url_raw:
-            raise ConfigEntryAuthFailed(
-                "SUEZ token URL is invalid or has expired — please reconfigure"
-            )
+            if status in (301, 302, 303, 307, 308) and location:
+                # Resolve relative Location header
+                if location.startswith("/"):
+                    current_url = "https://cz-sitr.suezsmartsolutions.com" + location
+                elif location.startswith("http"):
+                    current_url = location
+                else:
+                    current_url = urllib.parse.urljoin(current_url, location)
+                continue
 
-        return_path = urllib.parse.unquote(return_url_raw.group(1))
-        return_url = (
-            "https://cz-sitr.suezsmartsolutions.com" + return_path
-            if return_path.startswith("/")
-            else return_path
-        )
-        _LOGGER.debug("SUEZ auth: following ReturnUrl %s", return_url)
+            if status == 200:
+                if "Login.aspx" not in current_url:
+                    _LOGGER.debug("SUEZ auth complete: %s", current_url)
+                    return current_url
+                # Landed on Login page — token is invalid or expired
+                raise ConfigEntryAuthFailed(
+                    "SUEZ token URL is invalid or has expired — please reconfigure"
+                )
 
-        try:
-            async with session.get(
-                return_url,
-                allow_redirects=True,
-                timeout=aiohttp.ClientTimeout(total=30),
-                headers=_suez_headers,
-            ) as resp2:
-                resp2.raise_for_status()
-                final_url2 = str(resp2.url)
-                await resp2.text()
-        except aiohttp.ClientError as exc:
-            raise UpdateFailed(f"SUEZ ReturnUrl request failed: {exc}") from exc
+            raise UpdateFailed(f"SUEZ auth: unexpected HTTP {status} at {current_url}")
 
-        _LOGGER.debug("SUEZ auth: step-2 landed on %s", final_url2)
-
-        if final_url2.split("?")[0].endswith("Login.aspx"):
-            raise UpdateFailed(
-                "SUEZ authentication did not complete — the portal may be temporarily unavailable"
-            )
-
-        return final_url2
+        raise UpdateFailed("SUEZ auth: too many redirects")
 
     async def _suez_get_html(
         self,
