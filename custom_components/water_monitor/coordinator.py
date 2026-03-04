@@ -228,6 +228,14 @@ class BVKWaterCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     status = resp.status
                     location = resp.headers.get("Location", "")
                     await resp.text()  # consume body so connection is released
+
+                    # aiohttp's CookieJar only keeps the first Set-Cookie header
+                    # when the same name appears twice.  The SUEZ server always
+                    # sends two SE_BVK_Cookie headers: an expired "clear" cookie
+                    # first, then the real value second.  We manually pick up the
+                    # last non-expired value for each name so it ends up in the jar.
+                    _inject_cookies(session, resp)
+
             except aiohttp.ClientError as exc:
                 raise UpdateFailed(f"SUEZ auth request failed: {exc}") from exc
 
@@ -424,6 +432,39 @@ def _extract_hidden(html: str, field_id: str) -> str | None:
             return m.group(1)
     m = re.search(rf'name="{re.escape(field_id)}"[^>]*value="([^"]*)"', html)
     return m.group(1) if m else None
+
+
+def _inject_cookies(
+    session: aiohttp.ClientSession, resp: aiohttp.ClientResponse
+) -> None:
+    """Work around aiohttp's duplicate-Set-Cookie bug.
+
+    When a server sends the same cookie name twice (e.g. once with an expired
+    date to clear an old value, then again with the real value), aiohttp's
+    SimpleCookie-based jar keeps only the first occurrence.  This helper
+    re-parses every Set-Cookie header in order and forcefully updates the jar
+    with the last non-expired value for each cookie name.
+    """
+    from yarl import URL as _URL
+
+    final: dict[str, str] = {}
+    for header in resp.headers.getall("Set-Cookie", []):
+        parts = [p.strip() for p in header.split(";")]
+        if not parts or "=" not in parts[0]:
+            continue
+        name, _, value = parts[0].partition("=")
+        # A cookie with a past expiry date is a deletion instruction — skip it
+        is_deletion = any(
+            p.lower().startswith("expires=") and (
+                "1999" in p or "2000" in p or "2001" in p or "2002" in p
+            )
+            for p in parts[1:]
+        )
+        if not is_deletion and value:
+            final[name.strip()] = value.strip()
+
+    if final:
+        session.cookie_jar.update_cookies(final, _URL(str(resp.url)))
 
 
 def _extract_input(html: str, field_suffix: str) -> str | None:
