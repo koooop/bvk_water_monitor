@@ -4,6 +4,7 @@ from __future__ import annotations
 import html as _html
 import logging
 import re
+import urllib.parse
 from typing import Any
 
 import aiohttp
@@ -234,35 +235,81 @@ class BVKWaterCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     async def _suez_authenticate(
         self, session: aiohttp.ClientSession, token_url: str
-    ) -> None:
-        """Authenticate with SUEZ using the given token URL, setting session cookies."""
+    ) -> str:
+        """Authenticate with SUEZ using the given token URL.
+
+        Returns the effective SUEZ home URL (may include a RefSite parameter
+        derived from the authentication redirect chain).
+        Raises UpdateFailed or ConfigEntryAuthFailed on error.
+        """
         _LOGGER.debug("SUEZ auth: requesting %s", token_url[:80])
+        _suez_headers = {
+            "Referer": "https://zis.bvk.cz/ConsumptionPlaceList.aspx",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "cs-CZ,cs;q=0.9,en;q=0.8",
+        }
         try:
             async with session.get(
                 token_url,
                 allow_redirects=True,
                 timeout=aiohttp.ClientTimeout(total=30),
-                headers={
-                    "Referer": "https://zis.bvk.cz/ConsumptionPlaceList.aspx",
-                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                    "Accept-Language": "cs-CZ,cs;q=0.9,en;q=0.8",
-                },
+                headers=_suez_headers,
             ) as resp:
                 resp.raise_for_status()
                 final_url = str(resp.url)
-                html = await resp.text()
+                await resp.text()
         except aiohttp.ClientError as exc:
             raise UpdateFailed(f"SUEZ authentication request failed: {exc}") from exc
 
-        _LOGGER.debug("SUEZ auth: landed on %s (html length=%d)", final_url, len(html))
+        _LOGGER.debug("SUEZ auth: step-1 landed on %s", final_url)
 
-        # Check for failed auth: redirected back to login page without a token
         final_path = final_url.split("?")[0]
-        if final_path.endswith("Login.aspx") and "token=" not in final_url:
+        if not final_path.endswith("Login.aspx"):
+            # Landed directly on a data page — authentication complete
+            return final_url
+
+        # We landed on Login.aspx. Two cases:
+        # A) ReturnUrl is present → token was valid; SUEZ needs one more GET to
+        #    complete the session handshake (standard ASP.NET Forms Auth pattern).
+        # B) No ReturnUrl and no token= in URL → token is genuinely invalid/expired.
+        return_url_raw = re.search(r"[?&]ReturnUrl=([^&\s]+)", final_url)
+        if not return_url_raw:
             raise ConfigEntryAuthFailed(
                 "SUEZ token URL is invalid or has expired — "
                 "please reconfigure the integration with a fresh token URL"
             )
+
+        # Follow the ReturnUrl to complete authentication
+        return_path = urllib.parse.unquote(return_url_raw.group(1))
+        if return_path.startswith("/"):
+            return_url = "https://cz-sitr.suezsmartsolutions.com" + return_path
+        else:
+            return_url = return_path
+        _LOGGER.debug("SUEZ auth: following ReturnUrl %s", return_url)
+
+        try:
+            async with session.get(
+                return_url,
+                allow_redirects=True,
+                timeout=aiohttp.ClientTimeout(total=30),
+                headers=_suez_headers,
+            ) as resp2:
+                resp2.raise_for_status()
+                final_url2 = str(resp2.url)
+                await resp2.text()
+        except aiohttp.ClientError as exc:
+            raise UpdateFailed(f"SUEZ ReturnUrl request failed: {exc}") from exc
+
+        _LOGGER.debug("SUEZ auth: step-2 landed on %s", final_url2)
+
+        if final_url2.split("?")[0].endswith("Login.aspx"):
+            raise ConfigEntryAuthFailed(
+                "SUEZ token URL is invalid or has expired — "
+                "please reconfigure the integration with a fresh token URL"
+            )
+
+        # Authentication complete; return the confirmed data-page URL
+        return final_url2
 
     async def _suez_get_html(
         self,
