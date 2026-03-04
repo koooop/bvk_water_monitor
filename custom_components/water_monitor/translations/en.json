@@ -2,32 +2,25 @@
   "config": {
     "step": {
       "user": {
-        "title": "BVK Water Monitor – Credentials",
+        "title": "BVK Water Monitor",
         "description": "Enter your BVK customer portal credentials ({bvk_url}).",
         "data": {
           "username": "Email address",
           "password": "Password"
         }
       },
-      "token": {
-        "title": "BVK Water Monitor – SUEZ Token URL",
-        "description": "The SUEZ smart-meter URL could not be detected automatically.\n\n{suez_instructions}\n\nThe URL should start with `https://cz-sitr.suezsmartsolutions.com/eMIS.SE_BVK/Login.aspx?token=`",
-        "data": {
-          "suez_token_url": "SUEZ token URL"
-        }
-      },
       "reauth_confirm": {
-        "title": "BVK Water Monitor – Refresh SUEZ Token",
-        "description": "Your SUEZ token has expired. Please provide a fresh one.\n\n{suez_instructions}\n\nThe URL should start with `https://cz-sitr.suezsmartsolutions.com/eMIS.SE_BVK/Login.aspx?token=`",
+        "title": "BVK Water Monitor – Re-authenticate",
+        "description": "Your BVK credentials have changed. Please enter them again.",
         "data": {
-          "suez_token_url": "SUEZ token URL"
+          "username": "Email address",
+          "password": "Password"
         }
       }
     },
     "error": {
       "invalid_auth": "Invalid email or password.",
-      "cannot_connect": "Could not connect to BVK portal. Check your network and try again.",
-      "invalid_token_url": "The URL does not look like a valid SUEZ token URL."
+      "cannot_connect": "Could not connect to BVK portal. Check your network and try again."
     },
     "abort": {
       "already_configured": "This BVK account is already configured.",

@@ -16,7 +16,6 @@ SUEZ_DAILY_URL = f"{SUEZ_BASE_URL}/Site_Energie.aspx?Affichage=ConsoJour"
 # Config keys
 CONF_USERNAME = "username"
 CONF_PASSWORD = "password"
-CONF_SUEZ_TOKEN_URL = "suez_token_url"
 
 # Coordinator
 DEFAULT_UPDATE_INTERVAL = timedelta(hours=2)
