@@ -1,35 +1,26 @@
 """DataUpdateCoordinator for BVK Water Monitor."""
 from __future__ import annotations
 
-import html as _html
 import logging
 import re
 import urllib.parse
 from typing import Any
 
 import aiohttp
+from yarl import URL
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .const import (
-    BVK_LOGIN_URL,
-    BVK_PLACE_LIST_URL,
-    CONF_PASSWORD,
-    CONF_USERNAME,
+    CONF_TOKEN_URL,
     DEFAULT_UPDATE_INTERVAL,
     SUEZ_BASE_URL,
     SUEZ_DAILY_URL,
-    SUEZ_HOME_URL,
 )
 
 _LOGGER = logging.getLogger(__name__)
-
-# BVK form field names (ASP.NET server controls)
-_BVK_FIELD_EMAIL = "ctl00$ctl00$lvLoginForm$LoginDialog1$edEmail"
-_BVK_FIELD_PASSWORD = "ctl00$ctl00$lvLoginForm$LoginDialog1$edPassword"
-_BVK_FIELD_SUBMIT = "ctl00$ctl00$lvLoginForm$LoginDialog1$btnLogin"
 
 # Use a realistic browser User-Agent so portals return full page content
 _HEADERS = {
@@ -51,9 +42,7 @@ class BVKWaterCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             name="BVK Water Monitor",
             update_interval=DEFAULT_UPDATE_INTERVAL,
         )
-        self._username: str = entry.data[CONF_USERNAME]
-        self._password: str = entry.data[CONF_PASSWORD]
-        self._session: aiohttp.ClientSession | None = None
+        self._token_url: str = entry.data.get(CONF_TOKEN_URL, "")
 
     # ------------------------------------------------------------------
     # Session management
@@ -66,132 +55,6 @@ class BVKWaterCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             headers=_HEADERS,
         )
 
-    async def async_shutdown(self) -> None:
-        """Close the dedicated HTTP session on unload."""
-        if self._session and not self._session.closed:
-            await self._session.close()
-            self._session = None
-        await super().async_shutdown()
-
-    # ------------------------------------------------------------------
-    # BVK portal helpers
-    # ------------------------------------------------------------------
-
-    async def _bvk_login(self, session: aiohttp.ClientSession) -> None:
-        """Log in to the BVK portal."""
-        try:
-            async with session.get(
-                BVK_LOGIN_URL, timeout=aiohttp.ClientTimeout(total=30)
-            ) as resp:
-                resp.raise_for_status()
-                html = await resp.text()
-        except aiohttp.ClientError as exc:
-            raise UpdateFailed(f"BVK login page fetch failed: {exc}") from exc
-
-        viewstate = _extract_hidden(html, "__VIEWSTATE")
-        if not viewstate:
-            raise UpdateFailed("Could not parse BVK login page (missing __VIEWSTATE)")
-
-        payload = {
-            "__VIEWSTATE": viewstate,
-            "__VIEWSTATEGENERATOR": _extract_hidden(html, "__VIEWSTATEGENERATOR") or "",
-            "__PREVIOUSPAGE": _extract_hidden(html, "__PREVIOUSPAGE") or "",
-            "__EVENTVALIDATION": _extract_hidden(html, "__EVENTVALIDATION") or "",
-            _BVK_FIELD_EMAIL: self._username,
-            _BVK_FIELD_PASSWORD: self._password,
-            _BVK_FIELD_SUBMIT: "Vstoupit",
-            "ctl00$ctl00$captchaToken": "",
-            "ctl00$ctl00$crs": "",
-        }
-        try:
-            async with session.post(
-                BVK_LOGIN_URL,
-                data=payload,
-                allow_redirects=True,
-                timeout=aiohttp.ClientTimeout(total=30),
-            ) as resp:
-                resp.raise_for_status()
-                html = await resp.text()
-        except aiohttp.ClientError as exc:
-            raise UpdateFailed(f"BVK login POST failed: {exc}") from exc
-
-        if "Odhlášení" not in html and "odhlaseni" not in html.lower():
-            raise ConfigEntryAuthFailed(
-                "BVK login failed — check your email and password"
-            )
-
-    async def _bvk_get_all_places(
-        self, session: aiohttp.ClientSession
-    ) -> list[dict[str, str]]:
-        """After BVK login, enumerate all consumption places and get fresh SUEZ token URLs.
-
-        Returns a list of dicts: {cp_id, cp_num, token_url}.
-        """
-        try:
-            async with session.get(
-                BVK_PLACE_LIST_URL, timeout=aiohttp.ClientTimeout(total=30)
-            ) as resp:
-                resp.raise_for_status()
-                html = await resp.text()
-        except aiohttp.ClientError as exc:
-            raise UpdateFailed(f"BVK ConsumptionPlaceList fetch failed: {exc}") from exc
-
-        # Find Show$N postback targets from HTML-encoded onclick attributes.
-        # The page renders onclick as: onclick="javascript:__doPostBack(&#39;target&#39;,&#39;Show$0&#39;)"
-        seen: set[int] = set()
-        show_targets: list[tuple[str, str]] = []
-        for onclick in re.findall(r'onclick=["\']([^"\']+)["\']', html):
-            decoded = _html.unescape(onclick)
-            m = re.search(r"__doPostBack\('([^']+)','(Show\$(\d+))'", decoded)
-            if m:
-                idx = int(m.group(3))
-                if idx not in seen:
-                    seen.add(idx)
-                    show_targets.append((m.group(1), m.group(2)))
-
-        _LOGGER.debug("BVK found %d consumption place(s)", len(show_targets))
-
-        if not show_targets:
-            return []
-
-        places: list[dict[str, str]] = []
-        for event_target, event_arg in show_targets:
-            payload = {
-                "__VIEWSTATE": _extract_hidden(html, "__VIEWSTATE") or "",
-                "__VIEWSTATEGENERATOR": _extract_hidden(html, "__VIEWSTATEGENERATOR") or "",
-                "__VIEWSTATEENCRYPTED": "",
-                "__EVENTVALIDATION": _extract_hidden(html, "__EVENTVALIDATION") or "",
-                "__EVENTTARGET": event_target,
-                "__EVENTARGUMENT": event_arg,
-            }
-            try:
-                async with session.post(
-                    BVK_PLACE_LIST_URL,
-                    data=payload,
-                    allow_redirects=True,
-                    timeout=aiohttp.ClientTimeout(total=30),
-                ) as resp:
-                    resp.raise_for_status()
-                    detail_html = await resp.text()
-            except aiohttp.ClientError as exc:
-                _LOGGER.warning("BVK postback %s failed: %s", event_arg, exc)
-                continue
-
-            cp_id = _extract_input(detail_html, "edCpId") or event_arg.replace("$", "_")
-            cp_num = (_extract_input(detail_html, "edCpEvNum") or cp_id).strip()
-
-            # Extract fresh SUEZ token URL — the first href pointing to cz-sitr
-            m = re.search(r'href="(https://cz-sitr[^"]+)"', detail_html)
-            if not m:
-                _LOGGER.warning("BVK %s: no SUEZ token URL found in MainInfo page", event_arg)
-                continue
-
-            token_url = _html.unescape(m.group(1))
-            places.append({"cp_id": cp_id, "cp_num": cp_num, "token_url": token_url})
-            _LOGGER.debug("BVK place %s (OM %s): token URL found", cp_id, cp_num)
-
-        return places
-
     # ------------------------------------------------------------------
     # SUEZ portal helpers
     # ------------------------------------------------------------------
@@ -202,68 +65,8 @@ class BVKWaterCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """Authenticate with SUEZ using the given token URL.
 
         Returns the effective SUEZ home URL (with RefSite parameter).
-
-        aiohttp's allow_redirects=True follows the 302 before the cookie jar is
-        updated, so the cookie (SE_BVK_Cookie) is missing from the redirect GET
-        and the portal sends us back to Login.aspx.  We therefore use
-        allow_redirects=False and follow redirects manually so each step sees the
-        cookies set by the previous response.
         """
-        _LOGGER.debug("SUEZ auth: requesting %s", token_url[:80])
-        _suez_headers = {
-            "Referer": "https://zis.bvk.cz/ConsumptionPlaceList.aspx",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "cs-CZ,cs;q=0.9,en;q=0.8",
-        }
-        current_url = token_url
-
-        for step in range(6):  # guard against infinite redirect loops
-            try:
-                async with session.get(
-                    current_url,
-                    allow_redirects=False,
-                    timeout=aiohttp.ClientTimeout(total=30),
-                    headers=_suez_headers,
-                ) as resp:
-                    status = resp.status
-                    location = resp.headers.get("Location", "")
-                    await resp.text()  # consume body so connection is released
-
-                    # aiohttp's CookieJar only keeps the first Set-Cookie header
-                    # when the same name appears twice.  The SUEZ server always
-                    # sends two SE_BVK_Cookie headers: an expired "clear" cookie
-                    # first, then the real value second.  We manually pick up the
-                    # last non-expired value for each name so it ends up in the jar.
-                    _inject_cookies(session, resp)
-
-            except aiohttp.ClientError as exc:
-                raise UpdateFailed(f"SUEZ auth request failed: {exc}") from exc
-
-            _LOGGER.debug("SUEZ auth step %d: status=%d url=%s location=%s",
-                          step + 1, status, current_url[:80], location[:80])
-
-            if status in (301, 302, 303, 307, 308) and location:
-                # Resolve relative Location header
-                if location.startswith("/"):
-                    current_url = "https://cz-sitr.suezsmartsolutions.com" + location
-                elif location.startswith("http"):
-                    current_url = location
-                else:
-                    current_url = urllib.parse.urljoin(current_url, location)
-                continue
-
-            if status == 200:
-                if "Login.aspx" not in current_url:
-                    _LOGGER.debug("SUEZ auth complete: %s", current_url)
-                    return current_url
-                # Landed on Login page — token is invalid or expired
-                raise ConfigEntryAuthFailed(
-                    "SUEZ token URL is invalid or has expired — please reconfigure"
-                )
-
-            raise UpdateFailed(f"SUEZ auth: unexpected HTTP {status} at {current_url}")
-
-        raise UpdateFailed("SUEZ auth: too many redirects")
+        return await _async_suez_authenticate(session, token_url)
 
     async def _suez_get_html(
         self,
@@ -357,81 +160,140 @@ class BVKWaterCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     # ------------------------------------------------------------------
 
     async def _async_update_data(self) -> dict[str, Any]:
-        """Log into BVK, get fresh SUEZ tokens per place, fetch consumption data."""
-
-        # Fresh session for the BVK login + place discovery phase
-        if self._session and not self._session.closed:
-            await self._session.close()
-        self._session = self._new_session()
-        session = self._session
-
-        # Step 1: BVK login → enumerate all consumption places
-        await self._bvk_login(session)
-        places = await self._bvk_get_all_places(session)
-
-        if not places:
-            raise UpdateFailed(
-                "No consumption places found in the BVK portal. "
-                "Please verify your account has registered meters."
+        """Authenticate with the saved token URL and fetch its consumption data."""
+        if not _valid_token_url(self._token_url):
+            raise ConfigEntryAuthFailed(
+                "A valid SUEZ token URL is required; please reconfigure the integration."
             )
 
-        # Step 2: For each place, authenticate to SUEZ and fetch data
-        result: dict[str, Any] = {}
-        for place in places:
-            place_session = self._new_session()
-            try:
-                home_url = await self._suez_authenticate(place_session, place["token_url"])
+        session = self._new_session()
+        try:
+            home_url = await self._suez_authenticate(session, self._token_url)
+            query = urllib.parse.parse_qs(urllib.parse.urlsplit(home_url).query)
+            ref_site = query.get("RefSite", [""])[0]
+            cp_id = ref_site or "default"
+            daily_url = (
+                f"{SUEZ_BASE_URL}/Site_Energie.aspx?"
+                f"{urllib.parse.urlencode({'Affichage': 'ConsoJour', 'RefSite': ref_site})}"
+                if ref_site
+                else SUEZ_DAILY_URL
+            )
 
-                # Use the same RefSite the auth landed on for the daily page too
-                ref_site_m = re.search(r"RefSite=([^&]+)", home_url)
-                daily_url = (
-                    f"{SUEZ_BASE_URL}/Site_Energie.aspx?Affichage=ConsoJour&RefSite={ref_site_m.group(1)}"
-                    if ref_site_m
-                    else SUEZ_DAILY_URL
-                )
+            home_html = await self._suez_get_html(session, home_url, self._token_url)
+            daily_html = await self._suez_get_html(session, daily_url, self._token_url)
+        except ConfigEntryAuthFailed:
+            raise
+        except (UpdateFailed, aiohttp.ClientError) as exc:
+            raise UpdateFailed(f"Failed to fetch SUEZ consumption data: {exc}") from exc
+        finally:
+            await session.close()
 
-                home_html = await self._suez_get_html(place_session, home_url, place["token_url"])
-                daily_html = await self._suez_get_html(place_session, daily_url, place["token_url"])
-            except ConfigEntryAuthFailed:
-                raise
-            except (UpdateFailed, aiohttp.ClientError) as exc:
-                _LOGGER.warning("Skipping place %s (%s): %s", place["cp_id"], place["cp_num"], exc)
-                continue
-            finally:
-                await place_session.close()
+        place_data: dict[str, Any] = {
+            **self._parse_home_page(home_html),
+            **self._parse_daily_page(daily_html),
+            "label": ref_site or "BVK",
+        }
+        if "daily_l" not in place_data and "today_l" in place_data:
+            place_data["daily_l"] = place_data["today_l"]
 
-            place_data: dict[str, Any] = {
-                **self._parse_home_page(home_html),
-                **self._parse_daily_page(daily_html),
-            }
-            place_data["label"] = place["cp_num"]
-            if "daily_l" not in place_data and "today_l" in place_data:
-                place_data["daily_l"] = place_data["today_l"]
+        if not any(
+            key in place_data for key in ("meter_index_m3", "daily_l", "monthly_l")
+        ):
+            raise UpdateFailed(
+                "No consumption data was found for the configured SUEZ token URL"
+            )
 
-            result[place["cp_id"]] = place_data
-            _LOGGER.debug("BVK place %s data: %s", place["cp_id"], place_data)
-
-        if not result:
-            raise UpdateFailed("Failed to fetch data from any consumption place")
-
-        return result
+        _LOGGER.debug("BVK place %s data: %s", cp_id, place_data)
+        return {cp_id: place_data}
 
 
 # ------------------------------------------------------------------
 # Helpers
 # ------------------------------------------------------------------
 
-def _extract_hidden(html: str, field_id: str) -> str | None:
-    """Extract value of an ASP.NET hidden field by name or id."""
-    for attr in ("name", "id"):
-        m = re.search(
-            rf'<input[^>]+{attr}="{re.escape(field_id)}"[^>]+value="([^"]*)"',
-            html,
+_SUEZ_HOST = "cz-sitr.suezsmartsolutions.com"
+_SUEZ_TOKEN_PATH = "/eMIS.SE_BVK/Login.aspx"
+
+
+def _valid_token_url(token_url: str) -> bool:
+    """Return whether the supplied URL is a safe SUEZ token URL."""
+    try:
+        if any(character.isspace() for character in token_url):
+            return False
+        parsed = urllib.parse.urlsplit(token_url)
+        query = urllib.parse.parse_qs(parsed.query)
+        token = query.get("token", [""])[0]
+        return (
+            parsed.scheme == "https"
+            and parsed.hostname == _SUEZ_HOST
+            and parsed.port in (None, 443)
+            and parsed.username is None
+            and parsed.password is None
+            and parsed.path == _SUEZ_TOKEN_PATH
+            and not parsed.fragment
+            and bool(token.strip())
         )
-        if m:
-            return m.group(1)
-    m = re.search(rf'name="{re.escape(field_id)}"[^>]*value="([^"]*)"', html)
-    return m.group(1) if m else None
+    except ValueError:
+        return False
+
+
+async def _async_suez_authenticate(
+    session: aiohttp.ClientSession, token_url: str
+) -> str:
+    """Authenticate at SUEZ and return the effective home URL."""
+    if not _valid_token_url(token_url):
+        raise ConfigEntryAuthFailed("The configured SUEZ token URL is invalid.")
+
+    current_url = token_url
+    headers = {
+        **_HEADERS,
+        "Referer": "https://zis.bvk.cz/ConsumptionPlaceList.aspx",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "cs-CZ,cs;q=0.9,en;q=0.8",
+    }
+
+    for _ in range(6):
+        parsed = urllib.parse.urlsplit(current_url)
+        if (
+            parsed.scheme != "https"
+            or parsed.hostname != _SUEZ_HOST
+            or parsed.port not in (None, 443)
+            or parsed.username is not None
+            or parsed.password is not None
+        ):
+            raise UpdateFailed("SUEZ authentication redirected to an unexpected host")
+
+        try:
+            async with session.get(
+                current_url,
+                allow_redirects=False,
+                timeout=aiohttp.ClientTimeout(total=30),
+                headers=headers,
+            ) as resp:
+                status = resp.status
+                location = resp.headers.get("Location", "")
+                await resp.text()
+                _inject_cookies(session, resp)
+        except aiohttp.ClientError:
+            raise UpdateFailed("SUEZ authentication request failed") from None
+
+        if status in (301, 302, 303, 307, 308) and location:
+            current_url = urllib.parse.urljoin(current_url, location)
+            continue
+
+        if status == 200:
+            if (
+                urllib.parse.urlsplit(current_url).path.rsplit("/", 1)[-1].lower()
+                != "login.aspx"
+            ):
+                return current_url
+            raise ConfigEntryAuthFailed(
+                "The SUEZ token URL is invalid or has expired; reconfigure the integration."
+            )
+
+        raise UpdateFailed(f"SUEZ authentication returned HTTP {status}")
+
+    raise UpdateFailed("SUEZ authentication exceeded the redirect limit")
 
 
 def _inject_cookies(
@@ -445,8 +307,6 @@ def _inject_cookies(
     re-parses every Set-Cookie header in order and forcefully updates the jar
     with the last non-expired value for each cookie name.
     """
-    from yarl import URL as _URL
-
     final: dict[str, str] = {}
     for header in resp.headers.getall("Set-Cookie", []):
         parts = [p.strip() for p in header.split(";")]
@@ -464,18 +324,4 @@ def _inject_cookies(
             final[name.strip()] = value.strip()
 
     if final:
-        session.cookie_jar.update_cookies(final, _URL(str(resp.url)))
-
-
-def _extract_input(html: str, field_suffix: str) -> str | None:
-    """Extract input value by matching the last segment of its name attribute."""
-    m = re.search(
-        rf'name="[^"]*{re.escape(field_suffix)}"[^>]*value="([^"]*)"',
-        html,
-    )
-    if not m:
-        m = re.search(
-            rf'value="([^"]*)"[^>]*name="[^"]*{re.escape(field_suffix)}"',
-            html,
-        )
-    return m.group(1) if m else None
+        session.cookie_jar.update_cookies(final, URL(str(resp.url)))

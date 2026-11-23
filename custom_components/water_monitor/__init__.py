@@ -1,13 +1,32 @@
 """BVK Water Monitor integration."""
 from __future__ import annotations
 
+import logging
+
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 
-from .const import DOMAIN
+from .const import CONF_TOKEN_URL, DOMAIN
 from .coordinator import BVKWaterCoordinator
 
 PLATFORMS = ["sensor"]
+_LOGGER = logging.getLogger(__name__)
+
+
+async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """Remove obsolete BVK credentials when migrating to token URL auth."""
+    if entry.version == 1:
+        hass.config_entries.async_update_entry(
+            entry,
+            data={CONF_TOKEN_URL: ""},
+            unique_id=f"legacy-{entry.entry_id}",
+            version=2,
+        )
+        _LOGGER.warning(
+            "BVK Water Monitor settings were migrated. Enter a SUEZ token URL "
+            "to reconnect; stored BVK credentials have been removed."
+        )
+    return True
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:

@@ -1,144 +1,139 @@
 """Config flow for BVK Water Monitor."""
 from __future__ import annotations
 
+import hashlib
 from typing import Any
 
 import aiohttp
 import voluptuous as vol
 from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
-from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.exceptions import ConfigEntryAuthFailed
+from homeassistant.helpers.update_coordinator import UpdateFailed
 
-from .const import (
-    BVK_LOGIN_URL,
-    BVK_PLACE_LIST_URL,
-    CONF_PASSWORD,
-    CONF_USERNAME,
-    DOMAIN,
-)
-from .coordinator import _extract_hidden
+from .const import CONF_TOKEN_URL, DOMAIN
+from .coordinator import _async_suez_authenticate, _valid_token_url
 
-_CREDENTIALS_SCHEMA = vol.Schema(
-    {
-        vol.Required(CONF_USERNAME): str,
-        vol.Required(CONF_PASSWORD): str,
-    }
-)
+_TOKEN_URL_SCHEMA = vol.Schema({vol.Required(CONF_TOKEN_URL): str})
 
 
 class WaterMonitorConfigFlow(ConfigFlow, domain=DOMAIN):
     """Handle a config flow for BVK Water Monitor."""
 
-    VERSION = 1
+    VERSION = 2
 
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """Single-step setup: validate BVK credentials and save."""
+        """Set up the integration with a SUEZ token URL."""
         errors: dict[str, str] = {}
 
         if user_input is not None:
-            username = user_input[CONF_USERNAME].strip()
-            password = user_input[CONF_PASSWORD]
-
-            error = await self._validate_credentials(username, password)
+            token_url = user_input[CONF_TOKEN_URL].strip()
+            error = await self._validate_token_url(token_url)
             if error:
                 errors["base"] = error
             else:
-                await self.async_set_unique_id(username.lower())
+                await self.async_set_unique_id(_token_url_unique_id(token_url))
                 self._abort_if_unique_id_configured()
                 return self.async_create_entry(
-                    title=f"BVK Water ({username})",
-                    data={
-                        CONF_USERNAME: username,
-                        CONF_PASSWORD: password,
-                    },
+                    title="BVK Water Monitor",
+                    data={CONF_TOKEN_URL: token_url},
                 )
 
         return self.async_show_form(
             step_id="user",
-            data_schema=_CREDENTIALS_SCHEMA,
+            data_schema=_TOKEN_URL_SCHEMA,
             errors=errors,
-            description_placeholders={"bvk_url": "https://zis.bvk.cz"},
         )
 
     async def async_step_reauth(
         self, entry_data: dict[str, Any]
     ) -> ConfigFlowResult:
-        """Triggered by ConfigEntryAuthFailed (wrong BVK credentials)."""
+        """Triggered when the SUEZ token URL is missing, invalid, or expired."""
         return await self.async_step_reauth_confirm()
 
     async def async_step_reauth_confirm(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """Re-enter BVK credentials."""
+        """Enter a replacement SUEZ token URL."""
         errors: dict[str, str] = {}
 
         if user_input is not None:
-            username = user_input[CONF_USERNAME].strip()
-            password = user_input[CONF_PASSWORD]
-
-            error = await self._validate_credentials(username, password)
+            token_url = user_input[CONF_TOKEN_URL].strip()
+            error = await self._validate_token_url(token_url)
             if error:
                 errors["base"] = error
             else:
-                return self.async_update_reload_and_abort(
-                    self._get_reauth_entry(),
-                    data_updates={
-                        CONF_USERNAME: username,
-                        CONF_PASSWORD: password,
-                    },
+                entry = self._get_reauth_entry()
+                token_id = _token_url_unique_id(token_url)
+                if self._token_url_configured(token_id, entry.entry_id):
+                    return self.async_abort(reason="already_configured")
+                self.hass.config_entries.async_update_entry(
+                    entry, data={CONF_TOKEN_URL: token_url}, unique_id=token_id
                 )
+                return self.async_update_reload_and_abort(entry)
 
         return self.async_show_form(
             step_id="reauth_confirm",
-            data_schema=_CREDENTIALS_SCHEMA,
+            data_schema=_TOKEN_URL_SCHEMA,
             errors=errors,
         )
 
-    async def _validate_credentials(self, username: str, password: str) -> str | None:
-        """Try BVK login and verify at least one consumption place exists.
+    async def async_step_reconfigure(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Replace the configured SUEZ token URL."""
+        entry = self._get_reconfigure_entry()
+        errors: dict[str, str] = {}
 
-        Returns an error key string on failure, or None on success.
-        """
-        session = async_get_clientsession(self.hass)
+        if user_input is not None:
+            token_url = user_input[CONF_TOKEN_URL].strip()
+            error = await self._validate_token_url(token_url)
+            if error:
+                errors["base"] = error
+            else:
+                token_id = _token_url_unique_id(token_url)
+                if self._token_url_configured(token_id, entry.entry_id):
+                    return self.async_abort(reason="already_configured")
+                self.hass.config_entries.async_update_entry(
+                    entry, data={CONF_TOKEN_URL: token_url}, unique_id=token_id
+                )
+                return self.async_update_reload_and_abort(entry)
+
+        return self.async_show_form(
+            step_id="reconfigure",
+            data_schema=_TOKEN_URL_SCHEMA,
+            errors=errors,
+        )
+
+    async def _validate_token_url(self, token_url: str) -> str | None:
+        """Check the URL format and authenticate directly with SUEZ."""
+        if not _valid_token_url(token_url):
+            return "invalid_token_url"
+
+        session = aiohttp.ClientSession(cookie_jar=aiohttp.CookieJar(unsafe=True))
         try:
-            async with session.get(
-                BVK_LOGIN_URL, timeout=aiohttp.ClientTimeout(total=20)
-            ) as resp:
-                resp.raise_for_status()
-                html = await resp.text()
-
-            viewstate = _extract_hidden(html, "__VIEWSTATE")
-            if not viewstate:
-                return "cannot_connect"
-
-            payload = {
-                "__VIEWSTATE": viewstate,
-                "__VIEWSTATEGENERATOR": _extract_hidden(html, "__VIEWSTATEGENERATOR") or "",
-                "__PREVIOUSPAGE": _extract_hidden(html, "__PREVIOUSPAGE") or "",
-                "__EVENTVALIDATION": _extract_hidden(html, "__EVENTVALIDATION") or "",
-                "ctl00$ctl00$lvLoginForm$LoginDialog1$edEmail": username,
-                "ctl00$ctl00$lvLoginForm$LoginDialog1$edPassword": password,
-                "ctl00$ctl00$lvLoginForm$LoginDialog1$btnLogin": "Vstoupit",
-                "ctl00$ctl00$captchaToken": "",
-                "ctl00$ctl00$crs": "",
-            }
-
-            async with session.post(
-                BVK_LOGIN_URL,
-                data=payload,
-                allow_redirects=True,
-                timeout=aiohttp.ClientTimeout(total=20),
-            ) as resp:
-                resp.raise_for_status()
-                html = await resp.text()
-
-            if "Odhlášení" not in html:
-                return "invalid_auth"
-
-        except aiohttp.ClientConnectorError:
+            await _async_suez_authenticate(session, token_url)
+        except ConfigEntryAuthFailed:
+            return "invalid_auth"
+        except (UpdateFailed, aiohttp.ClientError):
             return "cannot_connect"
-        except aiohttp.ClientResponseError:
-            return "cannot_connect"
+        finally:
+            await session.close()
 
         return None
+
+    def _token_url_configured(self, token_id: str, current_entry_id: str) -> bool:
+        """Check for another entry using the same token without rejecting itself."""
+        return any(
+            entry.entry_id != current_entry_id and entry.unique_id == token_id
+            for entry in self.hass.config_entries.async_entries(DOMAIN)
+        )
+
+
+def _token_url_unique_id(token_url: str) -> str:
+    """Create a stable, non-secret config entry ID from the token."""
+    from urllib.parse import parse_qs, urlsplit
+
+    token = parse_qs(urlsplit(token_url).query)["token"][0]
+    return hashlib.sha256(token.encode()).hexdigest()
